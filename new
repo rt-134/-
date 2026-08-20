@@ -1,0 +1,290 @@
+import requests
+import time
+import re
+import sqlite3
+from datetime import datetime, timezone
+import pytz
+
+# =====================================================
+# 1. الإعدادات الأساسية
+# =====================================================
+TELEGRAM_BOT_TOKEN = "8850057335:AAHm7mda1hRWMz5IOAsAoG4PUeYxdFeFm48"
+TELEGRAM_CHAT_ID = "587293170"
+
+FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+LOCAL_TIMEZONE = pytz.timezone("Asia/Baghdad")
+
+ALLOWED_IMPACTS = ["High", "Medium", "Low"]
+
+INVERSE_INDICATORS = [
+    "unemployment rate",
+    "jobless claims",
+    "trade balance",
+    "continuing claims"
+]
+
+IMPACT_BADGES = {
+    "High": "🔴 عالي التأثير",
+    "Medium": "🟠 متوسط التأثير",
+    "Low": "🟡 ضعيف التأثير"
+}
+
+# =====================================================
+# 2. إدارة قاعدة البيانات
+# =====================================================
+def init_db():
+    conn = sqlite3.connect("bot_cache.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sent_alerts (
+            event_id TEXT PRIMARY KEY,
+            alert_type TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def is_alert_sent(event_id, alert_type):
+    conn = sqlite3.connect("bot_cache.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM sent_alerts WHERE event_id = ? AND alert_type = ?", (event_id, alert_type))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+def mark_alert_sent(event_id, alert_type):
+    conn = sqlite3.connect("bot_cache.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO sent_alerts (event_id, alert_type) VALUES (?, ?)", (event_id, alert_type))
+    conn.commit()
+    conn.close()
+
+# =====================================================
+# 3. إرسال رسائل التلجرام
+# =====================================================
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        res_json = response.json()
+        return res_json.get("ok", False)
+    except Exception as e:
+        print(f"❌ خطأ اتصال أثناء الإرسال لتلجرام: {e}")
+        return False
+
+# =====================================================
+# 4. جلب البيانات بحماية
+# =====================================================
+def fetch_calendar_data():
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.forexfactory.com/"
+    }
+    try:
+        response = requests.get(FF_CALENDAR_URL, headers=headers, timeout=15)
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 60))
+            print(f"⚠️ سيرفر الأخبار يطلب الانتظار (429). انتظار إجباري {retry_after} ثانية...")
+            time.sleep(retry_after)
+            return None
+        else:
+            print(f"⚠️ فشل جلب البيانات: كود {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"❌ خطأ اتصال بسيرفر الأخبار: {e}")
+        return None
+
+# =====================================================
+# 5. معالجة وتحليل إشارات الذهب
+# =====================================================
+def parse_number(val_str):
+    if not val_str or str(val_str).strip() == "":
+        return None
+    cleaned = re.sub(r"[^\d.-]", "", str(val_str))
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+def get_scenarios(title):
+    is_inverse = any(ind in title.lower() for ind in INVERSE_INDICATORS)
+    if not is_inverse:
+        return "🔴 هبوط الذهب (SELL)", "🟢 صعود الذهب (BUY)"
+    else:
+        return "🟢 صعود الذهب (BUY)", "🔴 هبوط الذهب (SELL)"
+
+def analyze_gold_signal(title, actual_str, forecast_str):
+    act = parse_number(actual_str)
+    fc = parse_number(forecast_str)
+
+    if act is None or fc is None:
+        return "⚪ <b>NEUTRAL (البيانات غير رقمية للمقارنة)</b>"
+
+    is_inverse = any(ind in title.lower() for ind in INVERSE_INDICATORS)
+
+    if act > fc:
+        usd_bullish = not is_inverse
+    elif act < fc:
+        usd_bullish = is_inverse
+    else:
+        return "⚪ <b>NEUTRAL (النتيجة مطابقة تماماً للمتوقع)</b>"
+
+    if usd_bullish:
+        return "🔴 <b>SELL (بيع الذهب)</b>\n<i>البيانات إيجابية للدولار ⭢ ضغط هبوطي على الذهب</i>"
+    else:
+        return "🟢 <b>BUY (شراء الذهب)</b>\n<i>البيانات سلبية للدولار ⭢ دعم صعودي للذهب</i>"
+
+# =====================================================
+# 6. بناء الرسائل المنسقة
+# =====================================================
+def send_daily_agenda(events):
+    today_date = datetime.now(LOCAL_TIMEZONE).strftime("%Y-%m-%d")
+    today_events = []
+
+    for item in events:
+        if item.get("country") != "USD" or item.get("impact") not in ALLOWED_IMPACTS:
+            continue
+        event_dt = datetime.fromisoformat(item["date"]).astimezone(LOCAL_TIMEZONE)
+        if event_dt.strftime("%Y-%m-%d") == today_date:
+            today_events.append((event_dt, item))
+
+    if not today_events:
+        print(f"ℹ️ لا توجد أخبار للدولار مجدولة لليوم ({today_date}).")
+        return
+
+    today_events.sort(key=lambda x: x[0])
+    message = f"📅 <b>أجندة أخبار الدولار (USD) لليوم</b>\n━━━━━━━━━━━━━━━━━━\n"
+    for dt, item in today_events:
+        time_str = dt.strftime("%I:%M %p")
+        badge = IMPACT_BADGES.get(item.get("impact"), "⚪")
+        message += f"▫️ <b>{time_str}</b> | {badge} | {item['title']}\n"
+
+    message += f"\n💡 <i>سيتم التنبيه تلقائياً قبل كل خبر بـ 15 دقيقة مع السيناريوهات.</i>"
+    send_telegram(message)
+    print(f"✅ تم إرسال جدول أخبار اليوم ({len(today_events)} خبر).")
+
+def send_pre_news_alert(item, minutes_left):
+    event_time = datetime.fromisoformat(item["date"]).astimezone(LOCAL_TIMEZONE)
+    time_str = event_time.strftime("%I:%M %p")
+    high_scen, low_scen = get_scenarios(item["title"])
+    impact_display = IMPACT_BADGES.get(item.get("impact"), "")
+
+    message = (
+        f"⏳ <b>تنبيه استباقي: خبر بعد {int(minutes_left)} دقيقة</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📌 <b>الخبر:</b> {item['title']}\n"
+        f"🔥 <b>التأثير:</b> {impact_display}\n"
+        f"⏰ <b>الموعد:</b> {time_str} (توقيت بغداد)\n\n"
+        f"📊 <b>البيانات التقديرية:</b>\n"
+        f"▫️ المتوقع: <code>{item.get('forecast', '-')}</code> | السابق: <code>{item.get('previous', '-')}</code>\n\n"
+        f"🧠 <b>خارطة السيناريوهات المتوقعة:</b>\n"
+        f"1️⃣ إذا جاء الفعلي أعلى من المتوقع:\n   ↳ {high_scen}\n"
+        f"2️⃣ إذا جاء الفعلي أقل من المتوقع:\n   ↳ {low_scen}"
+    )
+    send_telegram(message)
+
+def send_instant_news_alert(item):
+    signal = analyze_gold_signal(item["title"], item.get("actual", ""), item.get("forecast", ""))
+    event_time = datetime.fromisoformat(item["date"]).astimezone(LOCAL_TIMEZONE)
+    time_str = event_time.strftime("%I:%M %p")
+    impact_display = IMPACT_BADGES.get(item.get("impact"), "")
+
+    message = (
+        f"🚨 <b>صدرت البيانات الآن - إشارة XAU/USD</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📌 <b>الخبر:</b> {item['title']}\n"
+        f"🔥 <b>درجة التأثير:</b> {impact_display}\n"
+        f"⏰ <b>الوقت:</b> {time_str}\n\n"
+        f"📊 <b>النتائج الرسمية:</b>\n"
+        f"▫️ الحالي (Actual): <b>{item.get('actual')}</b>\n"
+        f"▫️ المتوقع (Forecast): {item.get('forecast', '-')}\n"
+        f"▫️ السابق (Previous): {item.get('previous', '-')}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>الاتجاه المرجح للذهب:</b>\n"
+        f"{signal}"
+    )
+    send_telegram(message)
+
+# =====================================================
+# 7. حلقة المراقبة الذكية
+# =====================================================
+def run_bot():
+    init_db()
+    print("⏳ جاري بدء التشغيل...")
+    
+    send_telegram("🚀 <b>تم تشغيل نظام التداول ومراقبة الأخبار بنجاح!</b>")
+    print("✅ تم إرسال رسالة الاختبار إلى التلجرام.")
+
+    cached_events = []
+    last_calendar_fetch = 0
+    last_agenda_date = ""
+
+    while True:
+        current_timestamp = time.time()
+        now_utc = datetime.now(timezone.utc)
+        current_date_str = datetime.now(LOCAL_TIMEZONE).strftime("%Y-%m-%d")
+
+        # فحص هل نحن بالقرب من موعد صدور أي خبر (خلال 3 دقائق)
+        is_near_release = False
+        for item in cached_events:
+            if item.get("country") == "USD" and item.get("impact") in ALLOWED_IMPACTS:
+                event_dt = datetime.fromisoformat(item["date"])
+                diff = (event_dt - now_utc).total_seconds()
+                # إذا كان الخبر قد حان موعده ولم تصدر نتائجه بعد (بين 0 إلى -180 ثانية)
+                if -180 <= diff <= 60 and not item.get("actual"):
+                    is_near_release = True
+                    break
+
+        # تحديث الجدول: كل 15 دقيقة بالوضع الطبيعي، أو كل 10 ثوانٍ عند وقت الخبر المباشر
+        fetch_interval = 10 if is_near_release else 900
+        if current_timestamp - last_calendar_fetch > fetch_interval or not cached_events:
+            data = fetch_calendar_data()
+            if data:
+                cached_events = data
+                last_calendar_fetch = current_timestamp
+                print("🔄 تم تحديث جدول البيانات بنجاح.")
+
+        # إرسال أجندة الصباح اليومية
+        if cached_events and last_agenda_date != current_date_str:
+            send_daily_agenda(cached_events)
+            last_agenda_date = current_date_str
+
+        # معالجة التنبيهات من الذاكرة المحلية
+        for item in cached_events:
+            if item.get("country") != "USD" or item.get("impact") not in ALLOWED_IMPACTS:
+                continue
+
+            event_id = f"{item['title']}_{item['date']}"
+            event_dt = datetime.fromisoformat(item["date"])
+            time_diff_minutes = (event_dt - now_utc).total_seconds() / 60.0
+
+            # 1. تنبيه استباقي (10 إلى 16 دقيقة قبل الخبر)
+            if 0 < time_diff_minutes <= 16:
+                if not is_alert_sent(event_id, "PRE_ALERT"):
+                    send_pre_news_alert(item, time_diff_minutes)
+                    mark_alert_sent(event_id, "PRE_ALERT")
+                    print(f"📢 تنبيه استباقي: {item['title']}")
+
+            # 2. تنبيه لحظي عند صدور الرقم الفعلي
+            actual_val = item.get("actual")
+            if actual_val and actual_val.strip() != "":
+                if not is_alert_sent(event_id, "INSTANT_ALERT"):
+                    send_instant_news_alert(item)
+                    mark_alert_sent(event_id, "INSTANT_ALERT")
+                    print(f"⚡ تنبيه فوري: {item['title']}")
+
+        # فحص محلي مستمر كل ثانية دون استهلاك للسيرفر
+        time.sleep(1)
+
+if __name__ == "__main__":
+    run_bot()
